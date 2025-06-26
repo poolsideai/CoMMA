@@ -1,0 +1,43 @@
+[package]
+name = "nccl-profiler"
+version = "0.2.0"
+edition = "2021"
+
+[profile.release]
+debug = 1
+opt-level = 3
+lto = true
+
+[lib]
+name = "nccl_profiler"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "integration_benchmark"
+path = "src/integration_benchmark.rs"
+
+[[bench]]
+name = "clock"
+harness = false
+
+[build-dependencies]
+bindgen = "0.66.0"
+cmake = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+
+[dependencies]
+clap = { version = "4.5.37", features = ["derive"] }
+crossbeam = "0.8.4"
+env_logger = "0.11.5"
+histogram = "0.11.2"
+libc = "0.2.169"
+libloading = "0.8.6"
+log = "0.4.20"
+nom = "8.0.0"
+rand = "0.9.0"
+serde_json = "1.0"
+static_assertions = "1.1.0"
+tempfile = "3.19.0"
+tokio = { version = "1.43.0", features = ["full"] }

@@ -201,7 +201,17 @@ async fn exporter(
     mut rx: mpsc::Receiver<Telemetry>,
 ) -> std::io::Result<()> {
     let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
-        let path = template.replace("%p", &format!("{}", profiler.pid));
+        let mut path = template.replace("%p", &format!("{}", profiler.pid));
+        if path.contains("%h") {
+            match gethostname::gethostname().into_string() {
+                Ok(hostname) => {
+                    path = path.replace("%h", &hostname);
+                },
+                Err(hostname) => {
+                    error!("Failed to convert the host name {:?} into a string.", hostname);
+                },
+            }
+        }
         build_bufwriter(path).await
     } else {
         None

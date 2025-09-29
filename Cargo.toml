@@ -31,6 +31,7 @@ criterion = { version = "0.4", features = ["html_reports"] }
 clap = { version = "4.5.37", features = ["derive"] }
 crossbeam = "0.8.4"
 env_logger = "0.11.5"
+gethostname = "1.0.2"
 histogram = "0.11.2"
 libc = "0.2.169"
 libloading = "0.8.6"

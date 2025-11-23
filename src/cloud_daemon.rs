@@ -385,7 +385,7 @@ mod tests {
         let latency_template = format!("{}/latency-%p.txt", temp_dir_path);
         let summary_template = format!("{}/summary-%p.txt", temp_dir_path);
         // create a mock Profiler object
-        let mut profiler = Profiler::new(Version::V1);
+        let mut profiler = Profiler::new(Version::V1, None);
         profiler.pid = pid;
         profiler.config.track_group = true;
         profiler.config.track_ncclop = true;
@@ -404,6 +404,7 @@ mod tests {
                 Instant::now(),
                 /* id = */ 0,
                 /* comm_hash_override = */ None,
+                /* phase = */ 0,
             ));
             let proxyop_descr_casted = unsafe { proxyop_descr.cast_to_proxyop() };
             let proxyops: Vec<_> = (0..N_PROXYOP)
@@ -428,6 +429,7 @@ mod tests {
                     start_time: 123,
                     fifo_wait_dur_ns: None,
                     dur_ns: 256,
+                    phase: 0,
                 });
                 thread_state
                     .send_to_daemon(Message::StepBatch(proxyop.clone(), step_batch, true), true);
@@ -478,7 +480,7 @@ mod tests {
     {
         let _lg = NCCLOP_TEST_MUTEX.lock().unwrap();
 
-        let profiler = Box::new(Profiler::new(Version::V1));
+        let profiler = Box::new(Profiler::new(Version::V1, None));
 
         std::thread::scope(|s| {
             let (tx, rx) = mpsc::channel::<Telemetry>(n_ncclop);
@@ -517,6 +519,7 @@ mod tests {
                     Instant::now(),
                     op_idx,
                     /* comm_hash_override= */ None,
+                    /* phase = */ 0,
                 ));
                 thread_state.send_to_daemon(Message::NcclOp(coll), true);
             }
@@ -540,6 +543,7 @@ mod tests {
                     Instant::now() - NCCLOP_TIMEOUT,
                     op_idx,
                     /* comm_hash_override= */ None,
+                    /* phase = */ 0,
                 ));
                 thread_state.send_to_daemon(Message::NcclOp(coll), true);
             }
@@ -569,6 +573,7 @@ mod tests {
                     Instant::now() + Duration::from_secs(3600),
                     op_idx,
                     /* comm_hash_override= */ None,
+                    /* phase = */ 0,
                 ));
                 thread_state.send_to_daemon(Message::NcclOp(coll), true);
             }

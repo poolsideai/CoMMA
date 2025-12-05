@@ -74,7 +74,7 @@ pub struct Profiler {
 }
 
 pub const EVENT_QUEUE_SZ: usize = 8192;
-const CTRL_FIFO_SZ: usize = 256;
+const CTRL_FIFO_SZ: usize = 4096;
 
 impl Profiler {
     pub fn new(version: Version, rank: Option<i32>) -> Self {
@@ -182,9 +182,13 @@ impl Profiler {
     }
 
     pub fn register_thread(&self, thread_ctrl: daemon::ThreadControl) {
-        self.ctrl_fifo
+        if self
+            .ctrl_fifo
             .push(daemon::ControlMessage::NewThread(thread_ctrl))
-            .unwrap();
+            .is_err()
+        {
+            log::error!("ctrl_fifo full (capacity {}), thread registration dropped", CTRL_FIFO_SZ);
+        }
     }
 
     pub fn init_thread_state(&'static self) -> Box<ThreadLocalState<'static>> {
@@ -231,7 +235,9 @@ where
 {
     THREAD_STATE.with_borrow_mut(|state| {
         if state.is_none() {
-            let profiler = PROFILER.get().unwrap();
+            let profiler = PROFILER.get().expect(
+                "PROFILER not initialized: event handler called before profiler_init completed"
+            );
             *state = Some(profiler.init_thread_state())
         }
         f(state.as_mut().unwrap())

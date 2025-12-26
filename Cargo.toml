@@ -6,7 +6,7 @@ edition = "2021"
 [profile.release]
 debug = 1
 opt-level = 3
-lto = true
+lto = false
 
 [lib]
 name = "nccl_profiler"

@@ -197,6 +197,12 @@ impl<'a> PollingContext<'a> {
     }
 
     fn reclaim_ncclop(&mut self, op: event::NcclOp) {
+        // Account NcclOp in phase metrics
+        // At this point ProxyOps are attached because reclaim happens after queue draining
+        if let Some(ref tracker) = self.profiler.phase_scope_tracker {
+            tracker.account_ncclop(&op);
+        }
+
         self.pending_telemetry
             .push_back(Telemetry::NcclOp(Box::new(op)));
     }
@@ -371,11 +377,12 @@ impl<'a> PollingContext<'a> {
     ) {
         let config = &self.profiler.config;
         let record_proxyop = config.track_proxyop || config.track_steps;
+        let attach_to_ncclop = record_proxyop || config.enable_phase_scope;
         if let Some(parent_handle) = info.parent() {
             if info.pid == self.profiler.pid {
                 if let Some(ncclop) = self.get_ncclop(parent_handle) {
                     ncclop_update(ncclop, end_time, Some(end_time));
-                    if record_proxyop {
+                    if attach_to_ncclop {
                         for p in proxyops {
                             ncclop.add_proxyop(*p);
                         }
@@ -407,7 +414,8 @@ impl<'a> PollingContext<'a> {
             Message::NcclOp(op) => {
                 let id = op.id();
                 let op = self.free_ncclop.take_and_free(op);
-                let _ = self.ncclops.insert(id, Box::new(op));
+                let boxed_op = Box::new(op);
+                let _ = self.ncclops.insert(id, boxed_op);
                 if self.free_ncclop.num_free() >= slab::FREELIST_BATCH {
                     self.free_ncclop.try_publish(&self.profiler.free_ncclop);
                 }
@@ -607,6 +615,66 @@ fn ipc_shm_path(pid: libc::pid_t) -> String {
     format!("nccl-profiler-{}", pid)
 }
 
+/// Scans PhaseMetrics HashMap for phases ready to export:
+/// - Ready: (pending_coll == 0 && end_time_ns > 0) || timeout
+fn check_and_export_ready_phases(ctx: &mut PollingContext) {
+    let tracker = match &ctx.profiler.phase_scope_tracker {
+        Some(t) => t,
+        None => return,
+    };
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    let timeout_ns = ctx.profiler.config.ncclop_timeout.as_nanos() as u64;
+
+    let mut ready_phases = Vec::new();
+
+    // Scan HashMap for ready phases
+    {
+        let map = tracker.phase_metrics.read().unwrap();
+        for (phase_id, metrics) in map.iter() {
+            let end_time_ns = metrics.end_time_ns.load(std::sync::atomic::Ordering::Acquire);
+
+            // Skip if still OPEN
+            if end_time_ns == 0 {
+                continue;
+            }
+
+            let pending = metrics.pending_coll.load(std::sync::atomic::Ordering::Acquire);
+            let timeout_reached = now_ns >= end_time_ns + timeout_ns;
+
+            // Ready conditions: all accounted OR timeout
+            if pending == 0 || timeout_reached {
+                if timeout_reached && pending > 0 && ctx.profiler.config.debug_phase_tracking {
+                    eprintln!("[WARN] Phase 0x{:x} timeout with {} pending ops (timeout={:?})",
+                              phase_id, pending, ctx.profiler.config.ncclop_timeout);
+                }
+                ready_phases.push(*phase_id);
+            }
+        }
+    }
+
+    // Export ready phases
+    for phase_id in ready_phases {
+        if let Some(scope) = tracker.finalize_and_remove_phase(phase_id) {
+            // Export to TelemetryPool
+            if let Ok(pool_guard) = ctx.profiler.telemetry_pool.lock() {
+                if let Some(pool) = pool_guard.as_ref() {
+                    if let Err(e) = pool.push(scope) {
+                        eprintln!("[DAEMON] Failed to export PhaseScope 0x{:x}: {}", phase_id, e);
+                    } else if ctx.profiler.config.debug_phase_tracking {
+                        eprintln!("[DAEMON] Exported PhaseScope 0x{:x} (ops={}, transfer_ops={})",
+                                  phase_id, scope.nccl_op_count, scope.transfer_op_count);
+                    }
+                }
+            }
+        }
+    }
+}
+
 const FIFO_FETCH_INTERVAL: Duration = Duration::from_secs(1);
 const FIFO_PROCESS_BATCH: usize = 512;
 const FIFO_RECV_BATCH: usize = profiler::EVENT_QUEUE_SZ;
@@ -634,6 +702,9 @@ where
 
     let ncclop_timeout = ctx.profiler.config.ncclop_timeout;
     let ncclop_comp_delay = ctx.profiler.config.ncclop_completion_delay;
+
+    let mut check_counter = 0u64;
+    const CHECK_INTERVAL: u64 = 10; // Check every 10 iterations (~1ms)
 
     while !ctx.stop.load(Ordering::Acquire) {
         while let Some(ctrl_msg) = ctx.profiler.ctrl_fifo.pop() {
@@ -710,6 +781,16 @@ where
             ctx.free_proxyop.try_publish(&ctx.profiler.free_proxyop);
         }
 
+        // Drain queues before reclaiming NcclOps to ensure ProxyOps are attached, required
+        // for PhaseScope accounting to work. account_ncclop() in reclaim_ncclop()
+        // needs ProxyOps for metric calculation
+        for thread in threads.iter_mut() {
+            thread.fifo.recv_many(FIFO_FETCH_INTERVAL, usize::MAX, false);
+            thread.fifo.process_many(usize::MAX, |msg| {
+                ctx.handle_fifo_message(msg, &mut thread.daemon_state);
+            });
+        }
+
         let mut n_processed = 0;
         let mut ncclops = std::mem::take(&mut ctx.ncclops);
         try_reclaim_ncclop(
@@ -745,6 +826,13 @@ where
             );
         }
         ctx.ncclops = ncclops;
+
+        // Periodic check for ready PhaseScopes
+        check_counter += 1;
+        if check_counter >= CHECK_INTERVAL {
+            check_counter = 0;
+            check_and_export_ready_phases(ctx);
+        }
 
         exporter.export(ctx, None)
     }

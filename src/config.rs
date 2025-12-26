@@ -20,6 +20,32 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+/// Get the auto-generated pool name based on PGID and rank
+pub fn auto_pool_name(rank: Option<i32>) -> String {
+    // Priority 1: Explicit override (testing, debugging)
+    if let Ok(name) = std::env::var("NCCL_PROFILER_TELEMETRY_POOL_NAME") {
+        return name;
+    }
+
+    // Priority 2: Job ID (if launcher sets it)
+    if let Ok(job_id) = std::env::var("NCCL_PROFILER_JOB_ID") {
+        if let Some(r) = rank {
+            return format!("/nccl_telemetry_{}_r{}", job_id, r);
+        } else {
+            return format!("/nccl_telemetry_{}", job_id);
+        }
+    }
+
+    // Priority 3: Auto-detect PGID (most common case)
+    let pgid = unsafe { libc::getpgid(0) };
+    if let Some(r) = rank {
+        format!("/nccl_telemetry_j{}_r{}", pgid, r)
+    } else {
+        // Fallback if rank not known yet (shouldn't happen)
+        format!("/nccl_telemetry_j{}", pgid)
+    }
+}
+
 pub static CONFIG: LazyLock<Config> = LazyLock::new(Config::from_env);
 
 macro_rules! field_from_env {
@@ -78,6 +104,12 @@ pub struct Config {
     // Telemetry uploading config
     pub gpuviz_lib: String, // copybara:strip(gpuviz)
     pub telemetry_mode: usize,
+
+    // PhaseScope accounting
+    pub enable_phase_scope: bool,
+    pub telemetry_pool_name: Option<String>,
+    pub telemetry_pool_capacity: usize,
+    pub debug_phase_tracking: bool,
 }
 
 impl Config {
@@ -116,6 +148,12 @@ impl Config {
         field_from_env!(s, gpuviz_lib, String::from(gpuviz::GPUVIZ_LIB_NAME));
         // copybara:strip_end
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 3);
+
+        // PhaseScope telemetry
+        field_from_env!(s, enable_phase_scope, false);
+        field_from_env!(s, telemetry_pool_name);
+        field_from_env!(s, telemetry_pool_capacity, 1024);
+        field_from_env!(s, debug_phase_tracking, false);
 
         s
     }

@@ -22,10 +22,12 @@ use crate::event_ffi::AsFFI as _;
 use crate::gpuviz;
 use crate::nccl_metadata;
 use crate::nccl_metadata::{Coll as _, Event as _, NcclOp as _, P2p as _, ProxyStep as _};
+use crate::phase_scope::PhaseScopeTracker;
 use crate::profiler_shim;
 use crate::slab;
 use crate::spsc;
 use crate::step_tracker::StepTracker;
+use crate::telemetry_pool::TelemetryPool;
 use crate::NcclResult;
 
 use crossbeam::queue::ArrayQueue;
@@ -53,6 +55,7 @@ pub struct Profiler {
     pub config: config::Config,
     pub version: Version,
     pub pid: libc::pid_t,
+    pub rank: Option<i32>, // NCCL rank (for telemetry pool naming)
     pub init_time: SystemTime,
     pub init_instant: Instant,
     pub gpuviz_lib: Option<Arc<gpuviz::GpuViz>>, // copybara:strip(gpuviz)
@@ -64,13 +67,17 @@ pub struct Profiler {
     pub free_proxyop: slab::AtomicFreeList<event::ProxyOp>,
     pub free_step_batch: slab::AtomicFreeList<daemon::StepBatch>,
     pub cached_clock: clock::CachedClock,
+
+    // PhaseScope accounting
+    pub phase_scope_tracker: Option<PhaseScopeTracker>,
+    pub telemetry_pool: Mutex<Option<TelemetryPool>>,
 }
 
 pub const EVENT_QUEUE_SZ: usize = 8192;
-const CTRL_FIFO_SZ: usize = 256;
+const CTRL_FIFO_SZ: usize = 4096;
 
 impl Profiler {
-    pub fn new(version: Version) -> Self {
+    pub fn new(version: Version, rank: Option<i32>) -> Self {
         let config = &*config::CONFIG;
         let init_time = SystemTime::now();
         let init_instant = Instant::now();
@@ -78,6 +85,7 @@ impl Profiler {
             config: config.clone(),
             version,
             pid: unsafe { libc::getpid() },
+            rank,
             init_time,
             init_instant,
             // copybara:strip_begin(gpuviz)
@@ -103,6 +111,14 @@ impl Profiler {
             free_proxyop: slab::AtomicFreeList::default(),
             free_step_batch: slab::AtomicFreeList::default(),
             cached_clock: clock::CachedClock::new(init_instant),
+
+            // Phase-aware telemetry accounting
+            phase_scope_tracker: if config.enable_phase_scope {
+                Some(PhaseScopeTracker::new_with_rank(rank))
+            } else {
+                None
+            },
+            telemetry_pool: Mutex::new(None),
         }
     }
 
@@ -136,6 +152,24 @@ impl Profiler {
         let mut lg = self.daemon.lock().unwrap();
         let daemon = daemon::Daemon::new(self);
         *lg = Some(daemon);
+
+        // Initialize TelemetryPool if phase tracking enabled
+        if self.config.enable_phase_scope {
+            // Use auto-generated pool name based on PGID + rank
+            let pool_name = config::auto_pool_name(self.rank);
+
+            match TelemetryPool::create(&pool_name, self.config.telemetry_pool_capacity as u64) {
+                Ok(pool) => {
+                    let mut pool_lg = self.telemetry_pool.lock().unwrap();
+                    *pool_lg = Some(pool);
+                    log::info!("TelemetryPool initialized: name={}, capacity={}, rank={:?}",
+                             pool_name, self.config.telemetry_pool_capacity, self.rank);
+                }
+                Err(e) => {
+                    log::error!("Failed to create TelemetryPool '{}': {}", pool_name, e);
+                }
+            }
+        }
     }
 
     pub fn join_daemon(&'static self) {
@@ -148,9 +182,13 @@ impl Profiler {
     }
 
     pub fn register_thread(&self, thread_ctrl: daemon::ThreadControl) {
-        self.ctrl_fifo
+        if self
+            .ctrl_fifo
             .push(daemon::ControlMessage::NewThread(thread_ctrl))
-            .unwrap();
+            .is_err()
+        {
+            log::error!("ctrl_fifo full (capacity {}), thread registration dropped", CTRL_FIFO_SZ);
+        }
     }
 
     pub fn init_thread_state(&'static self) -> Box<ThreadLocalState<'static>> {
@@ -197,7 +235,9 @@ where
 {
     THREAD_STATE.with_borrow_mut(|state| {
         if state.is_none() {
-            let profiler = PROFILER.get().unwrap();
+            let profiler = PROFILER.get().expect(
+                "PROFILER not initialized: event handler called before profiler_init completed"
+            );
             *state = Some(profiler.init_thread_state())
         }
         f(state.as_mut().unwrap())
@@ -278,7 +318,21 @@ impl ThreadLocalState<'_> {
         E: nccl_metadata::Event,
     {
         let id = self.profiler.ncclop_cnt.fetch_add(1, Ordering::Relaxed);
-        let op = event::NcclOp::from_descr(descr, time, id as _, comm_hash_override);
+        // Capture current phase for this NcclOp
+        let phase = if let Some(ref tracker) = self.profiler.phase_scope_tracker {
+            tracker.current_phase()
+        } else {
+            0
+        };
+
+        // Increment pending counter for this phase
+        if phase != 0 {
+            if let Some(ref tracker) = self.profiler.phase_scope_tracker {
+                tracker.increment_pending(phase);
+            }
+        }
+
+        let op = event::NcclOp::from_descr(descr, time, id as _, comm_hash_override, phase);
         self.ncclop_free_list
             .alloc_new(op, Some(&self.profiler.free_ncclop), true)
             .map(|op| {
@@ -385,8 +439,14 @@ pub fn init_handler(
             env_logger::init();
             // after this point we should be able to use all the log macros
 
-            PROFILER.set(Profiler::new(version)).unwrap();
-            PROFILER.get().unwrap().spawn_daemon();
+            // get_or_init: creates Profiler only on first init, reuses on subsequent cycles
+            PROFILER.get_or_init(|| Profiler::new(version, None));
+            // Always spawn daemon when INIT_FLAG=0 (daemon was stopped on last finalize)
+            let profiler = PROFILER.get().unwrap();
+            profiler.spawn_daemon();
+
+            // Initialize phase API for training code
+            crate::phase_api::init_phase_api(profiler);
         }
         *lg += 1;
 
@@ -405,15 +465,22 @@ pub fn init_handler_v4(
     comm_hash: u64,
     _n_nodes: i32,
     _n_ranks: i32,
-    _rank: i32,
+    rank: i32,
     version: Version,
 ) -> NcclResult<Box<Communicator>> {
     let mut mask = 0;
     if config::CONFIG.telemetry_mode > 0 {
         let mut lg = INIT_FLAG.lock().unwrap();
         if *lg == 0 {
-            PROFILER.set(Profiler::new(version)).unwrap();
-            PROFILER.get().unwrap().spawn_daemon();
+            // get_or_init: creates Profiler only on first init, reuses on subsequent cycles
+            // Pass rank to Profiler for auto-naming telemetry pool
+            PROFILER.get_or_init(|| Profiler::new(version, Some(rank)));
+            // Always spawn daemon when INIT_FLAG=0 (daemon was stopped on last finalize)
+            let profiler = PROFILER.get().unwrap();
+            profiler.spawn_daemon();
+
+            // Initialize phase API for training code
+            crate::phase_api::init_phase_api(profiler);
         }
         *lg += 1;
 
@@ -674,7 +741,12 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
         }
         event::Event::ProxyOp(mut data) => {
             thread_state.fifo.prefetch_next();
-            if let Some(step) = data.step_tracker.finalize() {
+            let phase = if let Some(ref tracker) = thread_state.profiler.phase_scope_tracker {
+                tracker.current_phase()
+            } else {
+                0
+            };
+            if let Some(step) = data.step_tracker.finalize(phase) {
                 data.get_steps_mut(thread_state).push(step);
             }
             if thread_state.profiler.config.track_proxyop {
@@ -714,7 +786,7 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
             thread_state.proxystep_free_list.free(data);
         }
         event::Event::Dummy(_) => (),
-        event::Event::SmallNcclOp(_) => (),
+        event::Event::SmallNcclOp(_) => {}
         event::Event::NcclOpLite(_) => {}
         event::Event::NcclOp(_) => {}
     });
@@ -731,10 +803,16 @@ where
 {
     if let event::Event::ProxyOp(data) = event {
         with_thread_state(|thread_state| {
-            // let n_steps = data.n_steps;
+            // Get current phase for tagging EventSteps
+            let phase = if let Some(ref tracker) = thread_state.profiler.phase_scope_tracker {
+                tracker.current_phase()
+            } else {
+                0
+            };
+
             let maybe_step = data.step_tracker.update_step(e_state, e_state_args, || {
                 thread_state.profiler.recent_timer_ns()
-            });
+            }, phase);
 
             if let Some(step) = maybe_step {
                 data.n_steps += 1;
@@ -794,6 +872,7 @@ pub fn finalize_handler(_comm: Box<Communicator>) -> NcclResult<()> {
         let mut lg = INIT_FLAG.lock().unwrap();
         if *lg == 1 {
             let profiler = PROFILER.get().unwrap();
+
             profiler.join_daemon();
         }
         *lg -= 1;

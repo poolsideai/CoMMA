@@ -128,7 +128,8 @@ pub struct NcclOp {
     child_start_time: Option<Instant>,
     comm_hash: Option<u64>, // starting from v4 comm_hash is no longer part of the event descriptor
     descr: nccl_metadata::EventMetadata,
-    proxyops: Option<Vec<ProxyOp>>,
+    pub proxyops: Option<Vec<ProxyOp>>, // Public for PhaseScope accounting
+    phase: u64, // Current Phase tag captured at NcclOp creation time
 }
 
 #[derive(Debug, Clone)]
@@ -183,7 +184,7 @@ pub struct ProxyOp {
     step_histograms: Vec<Arc<dyn AtomicHistogram<EventStep>>>,
     track_steps: bool,
     aggregate_steps: bool,
-    steps: Option<Vec<EventStep>>,
+    pub steps: Option<Vec<EventStep>>, // Public for PhaseScope accounting
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +244,7 @@ impl NcclOp {
         time: Instant,
         id: usize,
         comm_hash_override: Option<u64>,
+        phase: u64,
     ) -> Self
     where
         E: nccl_metadata::Event,
@@ -260,11 +262,16 @@ impl NcclOp {
             comm_hash: comm_hash_override,
             descr: descr.clone_to_metadata(),
             proxyops: None,
+            phase,
         }
     }
 
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub fn phase(&self) -> u64 {
+        self.phase
     }
 
     pub fn _get_descr(&self) -> &nccl_metadata::EventMetadata {
@@ -592,6 +599,9 @@ impl ProxyStep {
             start_time: time_to_ns(&start_time),
             fifo_wait_dur_ns,
             dur_ns: (self.end_time.unwrap() - net_start_time).as_nanos() as _,
+            // V4 API path doesn't support phase tracking
+            // let's hope some day it will: https://github.com/NVIDIA/nccl/issues/1916
+            phase: 0, 
         }
     }
 }

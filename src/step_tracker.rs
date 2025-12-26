@@ -24,6 +24,8 @@ pub struct EventStep {
     pub start_time: u64,
     pub fifo_wait_dur_ns: Option<u32>,
     pub dur_ns: u32,
+    /// Phase ID when this step was created (0 = no phase tracking)
+    pub phase: u64,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -46,7 +48,7 @@ impl EventStepInProgress {
         }
     }
 
-    fn finalize(&self) -> EventStep {
+    fn finalize(&self, phase: u64) -> EventStep {
         let fifo_wait_dur_ns = self.fifo_ready_time.map(|t| (t - self.start_time) as u32);
         let net_start_time = self.fifo_ready_time.unwrap_or(self.start_time);
         EventStep {
@@ -55,6 +57,7 @@ impl EventStepInProgress {
             start_time: self.start_time,
             fifo_wait_dur_ns,
             dur_ns: (self.end_time.unwrap() - net_start_time) as _,
+            phase,
         }
     }
 }
@@ -88,6 +91,7 @@ impl StepTracker {
         state: profiler_shim::ncclProfilerEventState_v1_t,
         args: &S,
         get_time_ns: T,
+        phase: u64,
     ) -> Option<EventStep>
     where
         T: FnOnce() -> u64,
@@ -123,7 +127,7 @@ impl StepTracker {
                             // after filling in the size, it is safe to
                             // "finalize" it
                             let last = steps_in_progress.pop_back().unwrap();
-                            to_emit = Some(last.finalize());
+                            to_emit = Some(last.finalize(phase));
                         }
                     }
                     self.last_in_progress_size = args.trans_size();
@@ -161,7 +165,7 @@ impl StepTracker {
                 let in_progress = steps_in_progress.get_mut(i);
                 in_progress.end_time = Some(get_time_ns());
                 if in_progress.size.is_some() {
-                    to_emit = steps_in_progress.remove_and_apply(i, |s| s.finalize());
+                    to_emit = steps_in_progress.remove_and_apply(i, |s| s.finalize(phase));
                 }
                 self.accumulated_size = args.trans_size();
                 to_emit
@@ -174,7 +178,7 @@ impl StepTracker {
                 let in_progress = steps_in_progress.get_mut(i);
                 in_progress.end_time = Some(get_time_ns());
                 in_progress.size = Some(args.trans_size() - self.accumulated_size);
-                to_emit = steps_in_progress.remove_and_apply(i, |s| s.finalize());
+                to_emit = steps_in_progress.remove_and_apply(i, |s| s.finalize(phase));
                 self.accumulated_size = args.trans_size();
                 to_emit
             }
@@ -182,14 +186,14 @@ impl StepTracker {
         }
     }
 
-    pub fn finalize(&mut self) -> Option<EventStep> {
+    pub fn finalize(&mut self, phase: u64) -> Option<EventStep> {
         if self.is_send && self.is_v1 {
             let steps_in_progress = &mut self.steps_in_progress;
             let accumulated_size = self.accumulated_size;
             let last = steps_in_progress.back_mut().unwrap();
             last.size = Some(accumulated_size - self.last_in_progress_size);
             let in_progress = steps_in_progress.pop_back().unwrap();
-            Some(in_progress.finalize())
+            Some(in_progress.finalize(phase))
         } else {
             None
         }
@@ -219,6 +223,7 @@ mod tests {
                     profiler_shim::proxy_event_state::v1::SEND_TRANSMITTED,
                     &args,
                     get_time,
+                    0,
                 ) {
                     steps.push(step);
                 }
@@ -227,12 +232,13 @@ mod tests {
                 profiler_shim::proxy_event_state::v1::SEND_DONE,
                 &args,
                 get_time,
+                0,
             ) {
                 steps.push(step);
             }
         }
 
-        if let Some(step) = tracker.finalize() {
+        if let Some(step) = tracker.finalize(0) {
             steps.push(step);
         }
 
@@ -262,6 +268,7 @@ mod tests {
                     profiler_shim::proxy_event_state::v1::RECV_POSTED,
                     &args,
                     get_time,
+                    0,
                 ) {
                     steps.push(step);
                 }
@@ -272,13 +279,14 @@ mod tests {
                     profiler_shim::proxy_event_state::v1::RECV_RECEIVED,
                     &args,
                     get_time,
+                    0,
                 ) {
                     steps.push(step);
                 }
             }
         }
 
-        if let Some(step) = tracker.finalize() {
+        if let Some(step) = tracker.finalize(0) {
             steps.push(step);
         }
 

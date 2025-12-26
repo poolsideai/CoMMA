@@ -22,12 +22,16 @@ mod fixed_batch;
 mod gpuviz;
 mod histogram;
 mod nccl_metadata;
+pub mod phase_api;
+pub mod phase_scope;
 mod profiler;
 pub mod profiler_shim;
 mod shm_fifo;
 mod slab;
 mod spsc;
-mod step_tracker;
+pub mod step_tracker;
+pub mod telemetry_ffi;
+pub mod telemetry_pool;
 
 use std::sync::OnceLock;
 
